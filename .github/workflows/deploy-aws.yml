@@ -22,27 +22,62 @@ jobs:
     - name: Push Docker image
       run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/back_eval2:latest
 
-    - name: Deploy to Backend via Bastion (Front)
+    # PASO 1: Conectar al Bastión (Front) para descargar, empaquetar y transferir la imagen al Back
+    # Nota: Requiere que la llave SSH del Backend esté guardada en el Bastión temporalmente para el SCP,
+    # o puedes pasarla dinámicamente como se muestra en el script a continuación.
+    - name: Prepare and Transfer Image via Bastion
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+          host: ${{ secrets.EC2_FRONT_PUBLIC_IP }} # Nos conectamos directamente al Bastión
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_FRONT_KEY }}
+          script: |
+            # 1. Autenticar Docker en el Bastión y descargar la imagen recién subida
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/back_eval2:latest
+            
+            # 2. Guardar la imagen en un archivo comprimido gzip
+            sudo docker save ${{ secrets.DOCKERHUB_USERNAME }}/back_eval2:latest | gzip > /tmp/back_eval2.tar.gz
+            
+            # 3. Crear temporalmente el archivo de la llave del Backend en el Bastión para poder hacer SCP
+            echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/backend_key.pem
+            chmod 400 /tmp/backend_key.pem
+            
+            # 4. Transferir el archivo comprimido al Backend a través de la red interna de AWS
+            scp -i /tmp/backend_key.pem -o StrictHostKeyChecking=no /tmp/back_eval2.tar.gz ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/tmp/back_eval2.tar.gz
+            
+            # 5. Limpieza de seguridad en el Bastión (eliminar llave y archivo tar)
+            rm -f /tmp/backend_key.pem
+            rm -f /tmp/back_eval2.tar.gz
+
+    # PASO 2: Conectar al Backend (vía Bastion proxy) para cargar la imagen localmente y levantar el contenedor
+    # Aquí el Backend ya no toca internet, lee el archivo transferido en el Paso 1.
+    - name: Deploy to Backend via Bastion Proxy
       uses: appleboy/ssh-action@v1.0.3
       with:
           # --- DESTINO FINAL (BACKEND) ---
-          host: ${{ secrets.EC2_HOST}}              # IP Privada del Back
-          username: ${{ secrets.EC2_USER}} 
-          key: ${{ secrets.EC2_SSH_KEY }} # Llave privada del Backend (.pem)
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }} 
+          key: ${{ secrets.EC2_SSH_KEY }}
           
           # --- CONFIGURACIÓN DEL BASTIÓN (FRONTEND) ---
-          proxy_host: ${{ secrets.EC2_FRONT_PUBLIC_IP }} # IP Pública del Front
-          proxy_username: ${{ secrets.EC2_USER}} 
-          proxy_key: ${{ secrets.EC2_FRONT_KEY }}       # Llave privada del Frontend (.pem)
+          proxy_host: ${{ secrets.EC2_FRONT_PUBLIC_IP }}
+          proxy_username: ${{ secrets.EC2_USER }} 
+          proxy_key: ${{ secrets.EC2_FRONT_KEY }}
           
           script: |
+            # 1. Desempaquetar y cargar la imagen en el Docker local del Backend
+            gunzip -c /tmp/back_eval2.tar.gz | sudo docker load
             
-            # Comandos de Docker
-            sudo docker pull ${{ secrets.DOCKERHUB_USERNAME }}/back_eval2:latest
+            # 2. Limpiar el archivo comprimido para liberar espacio en disco
+            rm -f /tmp/back_eval2.tar.gz
+            
+            # 3. Detener contenedor anterior y arrancar el nuevo (aislado de red externa si lo requieres)
             sudo docker stop backend || true
             sudo docker rm backend || true
             sudo docker run -d \
               -p 3000:3000 \
+              --network none \
               --env-file /home/ec2-user/.env \
               --name backend \
               ${{ secrets.DOCKERHUB_USERNAME }}/back_eval2:latest
